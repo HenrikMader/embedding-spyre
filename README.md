@@ -1,6 +1,6 @@
 # VectorDB Lab on IBM Power (ppc64le)
 
-This lab demonstrates how to host an OpenAI-compatible embedding model on IBM Power (using **vLLM** with IBM Spyre acceleration or Ollama/CPU) and integrate it with **OpenSearch** (running official `ppc64le` container images) as a Vector Database for PDF ingestion, semantic search, and high-throughput vector benchmarking.
+This lab demonstrates how to host an OpenAI-compatible embedding model on IBM Power (`ppc64le`) using **Ollama** (or **vLLM** with IBM Spyre acceleration) with **IBM Granite Embeddings**, and integrate it with **OpenSearch** as a Vector Database for PDF ingestion, semantic search, and performance benchmarking.
 
 ---
 
@@ -17,101 +17,110 @@ The lab includes reference PDFs located in `./Files`:
 ```mermaid
 flowchart TD
     subgraph UI["Streamlit Frontend (app.py)"]
-        PDF["📄 PDF Ingestion (Files/ folder or Custom)"]
-        Bench["🚀 Benchmark Tab (Spyre vs CPU)"]
+        Ingest["📥 PDF Ingestion (Files/ or Custom Upload)"]
         Search["🔍 Question & Chunk Retrieval"]
+        Bench["🚀 Performance & Batching Benchmark"]
     end
 
     subgraph PowerHost["IBM Power (ppc64le)"]
-        subgraph Accelerated["Spyre AI Accelerated"]
-            SpyreVLLM["vLLM on Spyre (Port 8000)"]
-            SpyreCard["IBM Spyre PCIe Card"]
-            SpyreVLLM --> SpyreCard
+        subgraph Inference["Inference Service (Port 11434 / 8000)"]
+            Ollama["Ollama / vLLM (granite-embedding)<br/>OpenAI-compatible /v1/embeddings"]
         end
 
-        subgraph Baseline["CPU Baseline"]
-            CPUVLLM["vLLM / Ollama on Power CPU (Port 8001)"]
-        end
-
-        subgraph VectorStore["OpenSearch Vector Database"]
-            OS["OpenSearch ppc64le (icr.io/ppc64le-oss/opensearch-ppc64le:3.3.0)"]
+        subgraph VectorStore["Vector Database (Port 9200)"]
+            OS["OpenSearch ppc64le<br/>(icr.io/ppc64le-oss/opensearch-ppc64le:3.3.0)<br/>k-NN HNSW Vector Index"]
         end
     end
 
-    PDF -->|1. Extract & Batch Embed| SpyreVLLM
-    PDF -->|2. Store Chunks + Metadata| OS
-    Bench -->|Batch Embeddings| SpyreVLLM
-    Bench -->|Batch Embeddings| CPUVLLM
-    Search -->|Query Embedding| SpyreVLLM
-    Search -->|k-NN Vector Query| OS
-    OS -->|Return Relevant Chunks| Search
+    Ingest -->|1. Extract & Batch Embed| Ollama
+    Ingest -->|2. Store Vectors & Chunks| OS
+    Search -->|1. Embed Question| Ollama
+    Search -->|2. k-NN Vector Query| OS
+    OS -->|3. Return Matched Chunks| Search
+    Bench -->|Benchmark Batch Sizes| Ollama
 ```
 
 ---
 
 ## Prerequisites
 
-1. **Linux on Power (`ppc64le`)** or local testing environment.
-2. **Docker / Podman** installed.
-3. **Python 3.10+**
+* **Linux on Power (`ppc64le`)** (RHEL 9 / SLES)
+* **Podman** installed
+* **Python 3.9+** with virtual environment
 
 ---
 
-## Quickstart
+## Step-by-Step Setup
 
-### 1. Start OpenSearch Vector Database (`ppc64le`)
-We use the official IBM Container Registry OpenSearch images built for `ppc64le`:
-* `icr.io/ppc64le-oss/opensearch-ppc64le:3.3.0`
-* `icr.io/ppc64le-oss/opensearch-ppc64le:3.5.0`
+### 1. Start OpenSearch Container (`ppc64le`)
 
-Pull the image and start via Docker/Podman Compose:
+Pull and start the official IBM Container Registry OpenSearch container:
+
 ```bash
-docker pull icr.io/ppc64le-oss/opensearch-ppc64le:3.3.0
-docker compose up -d
-```
-OpenSearch runs on `http://localhost:9200` with the k-NN plugin enabled.
-
-### 2. Start Inference Servers on IBM Power
-
-#### Option A: Start vLLM with IBM Spyre Acceleration (Port 8000)
-```bash
-vllm serve BAAI/bge-small-en-v1.5 \
-  --host 0.0.0.0 \
-  --port 8000
+podman run -d \
+  --name opensearch-vectordb \
+  -p 9200:9200 \
+  -p 9600:9600 \
+  -e "discovery.type=single-node" \
+  -e "DISABLE_SECURITY_PLUGIN=true" \
+  -e "OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g" \
+  -v opensearch-data:/usr/share/opensearch/data:Z \
+  icr.io/ppc64le-oss/opensearch-ppc64le:3.3.0
 ```
 
-#### Option B: Start Power CPU Baseline Server (Port 8001)
-Run a second instance for CPU comparison:
+Verify OpenSearch is running:
 ```bash
-vllm serve BAAI/bge-small-en-v1.5 \
-  --device cpu \
-  --host 0.0.0.0 \
-  --port 8001
+curl http://localhost:9200
 ```
 
-### 3. Run Streamlit UI
+---
+
+### 2. Start Ollama with IBM Granite Embedding
+
+Start the Ollama container on `ppc64le` and pull the `granite-embedding` model:
+
 ```bash
+# Start Ollama container
+podman run -d \
+  --name ollama-granite \
+  -p 11434:11434 \
+  -v ollama-data:/root/.ollama:Z \
+  icr.io/ppc64le-oss/ollama-ppc64le:v0.32.7
+
+# Pull IBM Granite Embedding model
+podman exec -it ollama-granite ollama pull granite-embedding
+```
+
+*(Alternatively, run vLLM on Spyre: `vllm serve ibm-granite/granite-embedding-278m-multilingual --port 8000`)*
+
+---
+
+### 3. Launch the Streamlit Lab Frontend
+
+```bash
+# Install Python dependencies
 pip install -r requirements.txt
+
+# Run Streamlit application
 streamlit run app.py
 ```
 
-Open your browser at `http://localhost:8501`.
+Open your browser at `http://<POWER_HOST_IP>:8501`.
 
 ---
 
 ## Lab Features & Workflow
 
 1. **📥 Ingest PDFs & Documents**:
-   - **One-Click Ingestion of `./Files`**: Automatically reads `Files/spyre_redbook.pdf` and `Files/hybrid_cloud.pdf`, splits them into overlapping passages with sliding window chunking, generates embeddings on Spyre, and bulk-indexes into OpenSearch with page numbers and document metadata.
-   - **Upload Custom PDFs**: Support for additional user documents.
+   * **One-Click Ingestion of `./Files`**: Automatically reads `Files/spyre_redbook.pdf` and `Files/hybrid_cloud.pdf`, splits text into overlapping sliding-window chunks, generates embeddings using `granite-embedding`, and bulk-indexes them into OpenSearch with page numbers and document titles.
+   * **Custom PDF Upload**: Drag and drop any custom PDF for automated chunking and ingestion.
 
-2. **🔍 Ask Questions & Retrieve Chunks**:
-   - Suggested preset prompts for Spyre and Hybrid Cloud topics.
-   - Retrieves top-k relevant chunks with similarity score cards, page numbers, and latency metrics.
+2. **🔍 Ask Questions & Retrieve Context Chunks**:
+   * Ask natural language questions or use preset sample prompts.
+   * Retrieves top-k most semantically relevant chunks with similarity score cards, page numbers, and query latency breakdown.
 
-3. **🚀 Benchmark (Spyre vs CPU)**:
-   - Benchmark using real extracted PDF chunks from `./Files` or synthetic batches.
-   - Compare throughput (`chunks/sec`) and latency (`ms/chunk`) between Spyre and CPU.
+3. **🚀 Performance & Batching Benchmark**:
+   * Benchmark embedding throughput (`chunks/sec`) and latency across different batch sizes (1, 8, 16, 32, 64) on real PDF chunks or synthetic corpus.
 
 4. **⚙️ Index Admin**:
-   - Create, verify, or reset the OpenSearch k-NN index.
+   * Create, verify, or reset the OpenSearch k-NN index on demand.
