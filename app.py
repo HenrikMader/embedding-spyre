@@ -15,11 +15,10 @@ st.caption("Demonstrating PDF ingestion (`Files/hybrid_cloud.pdf`, `Files/spyre_
 
 # Sidebar Configuration
 with st.sidebar:
-    st.header("🔧 Endpoints Configuration")
+    st.header("🔧 Configuration")
     
-    st.subheader("Inference Endpoints")
-    primary_url = st.text_input("Embedding Base URL (Ollama / vLLM)", value="http://localhost:11434/v1")
-    cpu_url = st.text_input("Secondary / CPU Base URL (for Benchmark)", value="http://localhost:8001/v1")
+    st.subheader("Inference Endpoint")
+    primary_url = st.text_input("Embedding Base URL", value="http://localhost:11434/v1")
     model_name = st.text_input("Embedding Model", value="granite-embedding")
     dimension = st.number_input("Vector Dimension", min_value=64, max_value=4096, value=384)
 
@@ -50,11 +49,11 @@ with st.sidebar:
 
         # Test OpenSearch
         try:
-            test_os = OpenSearch(hosts=[{"host": opensearch_host, "port": int(opensearch_port)}], use_ssl=False, verify_certs=False, timeout=5)
+            test_os = OpenSearch(hosts=[{"host": opensearch_host, "port": int(opensearch_port)}], use_ssl=False, verify_certs=False, timeout=5.0)
             info = test_os.info()
             st.success(f"✅ OpenSearch OK (Cluster: {info.get('cluster_name', 'connected')})")
         except Exception as e:
-            st.error(f"❌ OpenSearch error ({opensearch_host}:{opensearch_port}): {e}")
+            st.error(f"❌ OpenSearch connection refused ({opensearch_host}:{opensearch_port}). Ensure OpenSearch is running.")
 
 # Initialize Clients
 @st.cache_resource
@@ -65,11 +64,11 @@ def get_opensearch_client(host: str, port: int):
     return OpenSearch(
         hosts=[{"host": host, "port": int(port)}],
         use_ssl=False,
-        verify_certs=False
+        verify_certs=False,
+        timeout=10
     )
 
 primary_client = get_openai_client(primary_url)
-cpu_client = get_openai_client(cpu_url)
 os_client = get_opensearch_client(opensearch_host, opensearch_port)
 
 def get_single_embedding(client: OpenAI, text: str) -> list[float]:
@@ -87,7 +86,7 @@ def get_batch_embeddings(client: OpenAI, texts: list[str]) -> list[list[float]]:
     sorted_data = sorted(response.data, key=lambda x: x.index)
     return [item.embedding for item in sorted_data]
 
-def create_index():
+def create_index() -> bool:
     mapping = {
         "settings": {
             "index": {
@@ -113,11 +112,14 @@ def create_index():
             }
         }
     }
-    if not os_client.indices.exists(index=index_name):
-        os_client.indices.create(index=index_name, body=mapping)
-        st.success(f"Created index '{index_name}' with dimension {dimension} (HNSW).")
-    else:
-        st.info(f"Index '{index_name}' already exists.")
+    try:
+        if not os_client.indices.exists(index=index_name):
+            os_client.indices.create(index=index_name, body=mapping)
+            st.success(f"Created index '{index_name}' with dimension {dimension} (HNSW).")
+        return True
+    except Exception as e:
+        st.error(f"Failed to connect to OpenSearch ({opensearch_host}:{opensearch_port}): {e}. Please ensure the OpenSearch container is running.")
+        return False
 
 # PDF Chunking Utilities
 def extract_chunks_from_pdf(source, chunk_size: int = 500, chunk_overlap: int = 100) -> list[dict]:
@@ -133,7 +135,7 @@ def extract_chunks_from_pdf(source, chunk_size: int = 500, chunk_overlap: int = 
 
     for page_idx, page in enumerate(reader.pages):
         text = page.extract_text() or ""
-        text = " ".join(text.split())  # Clean extra whitespaces and newlines
+        text = " ".join(text.split())
         
         if not text:
             continue
@@ -197,7 +199,7 @@ def generate_benchmark_corpus(num_docs: int) -> list[dict]:
 tab_ingest, tab_search, tab_benchmark, tab_admin = st.tabs([
     "📥 Ingest PDFs & Documents",
     "🔍 Ask Questions & Retrieve Chunks",
-    "🚀 Benchmark (Spyre vs CPU)", 
+    "🚀 Benchmark & Performance", 
     "⚙️ Index Admin"
 ])
 
@@ -225,52 +227,52 @@ with tab_ingest:
 
         if local_pdfs:
             if st.button("🚀 Ingest All PDFs from `./Files`", type="primary"):
-                create_index()
-                prog_bar = st.progress(0)
-                status_text = st.empty()
-                
-                try:
-                    start_time = time.perf_counter()
-                    status_text.text("Extracting and chunking text from local PDFs...")
-                    all_chunks = load_all_local_pdf_chunks(chunk_size, chunk_overlap)
-                    st.write(f"📊 Extracted **{len(all_chunks)}** chunks across local PDFs.")
+                if create_index():
+                    prog_bar = st.progress(0)
+                    status_text = st.empty()
                     
-                    texts = [c["content"] for c in all_chunks]
-                    all_vectors = []
+                    try:
+                        start_time = time.perf_counter()
+                        status_text.text("Extracting and chunking text from local PDFs...")
+                        all_chunks = load_all_local_pdf_chunks(chunk_size, chunk_overlap)
+                        st.write(f"📊 Extracted **{len(all_chunks)}** chunks across local PDFs.")
+                        
+                        texts = [c["content"] for c in all_chunks]
+                        all_vectors = []
 
-                    status_text.text(f"Generating embeddings via '{model_name}' on {primary_url}...")
-                    for i in range(0, len(texts), embed_batch_size):
-                        batch = texts[i : i + embed_batch_size]
-                        vectors = get_batch_embeddings(primary_client, batch)
-                        all_vectors.extend(vectors)
-                        prog_bar.progress(min(1.0, (i + embed_batch_size) / len(texts)))
+                        status_text.text(f"Generating embeddings via '{model_name}' on {primary_url}...")
+                        for i in range(0, len(texts), embed_batch_size):
+                            batch = texts[i : i + embed_batch_size]
+                            vectors = get_batch_embeddings(primary_client, batch)
+                            all_vectors.extend(vectors)
+                            prog_bar.progress(min(1.0, (i + embed_batch_size) / len(texts)))
 
-                    status_text.text("Bulk indexing vectors into OpenSearch...")
-                    actions = [
-                        {
-                            "_index": index_name,
-                            "_source": {
-                                "filename": all_chunks[i]["filename"],
-                                "page": all_chunks[i]["page"],
-                                "chunk_id": all_chunks[i]["chunk_id"],
-                                "title": all_chunks[i]["title"],
-                                "content": all_chunks[i]["content"],
-                                "embedding": all_vectors[i]
+                        status_text.text("Bulk indexing vectors into OpenSearch...")
+                        actions = [
+                            {
+                                "_index": index_name,
+                                "_source": {
+                                    "filename": all_chunks[i]["filename"],
+                                    "page": all_chunks[i]["page"],
+                                    "chunk_id": all_chunks[i]["chunk_id"],
+                                    "title": all_chunks[i]["title"],
+                                    "content": all_chunks[i]["content"],
+                                    "embedding": all_vectors[i]
+                                }
                             }
-                        }
-                        for i in range(len(all_chunks))
-                    ]
-                    
-                    success_count, _ = helpers.bulk(os_client, actions)
-                    total_time = time.perf_counter() - start_time
-                    prog_bar.progress(1.0)
-                    status_text.empty()
-                    st.success(f"🎉 Successfully ingested **{success_count}** chunks from `./Files` into '{index_name}' in **{total_time:.2f}s** ({(success_count/total_time):.1f} chunks/sec)!")
-                    
-                    with st.expander("Preview Ingested Chunks"):
-                        st.dataframe(pd.DataFrame(all_chunks)[["filename", "page", "chunk_id", "content"]].head(20), use_container_width=True)
-                except Exception as e:
-                    st.error(f"Ingestion failed: {e}")
+                            for i in range(len(all_chunks))
+                        ]
+                        
+                        success_count, _ = helpers.bulk(os_client, actions)
+                        total_time = time.perf_counter() - start_time
+                        prog_bar.progress(1.0)
+                        status_text.empty()
+                        st.success(f"🎉 Successfully ingested **{success_count}** chunks from `./Files` into '{index_name}' in **{total_time:.2f}s** ({(success_count/total_time):.1f} chunks/sec)!")
+                        
+                        with st.expander("Preview Ingested Chunks"):
+                            st.dataframe(pd.DataFrame(all_chunks)[["filename", "page", "chunk_id", "content"]].head(20), use_container_width=True)
+                    except Exception as e:
+                        st.error(f"Ingestion failed: {e}")
         else:
             st.warning("No PDF files found in `./Files`.")
 
@@ -288,45 +290,45 @@ with tab_ingest:
                 st.dataframe(pd.DataFrame(all_chunks)[["filename", "page", "chunk_id", "content"]].head(15), use_container_width=True)
 
             if st.button("🚀 Embed & Ingest Uploaded PDF Chunks", type="primary"):
-                create_index()
-                prog_bar = st.progress(0)
-                status_text = st.empty()
-                
-                try:
-                    start_time = time.perf_counter()
-                    texts = [c["content"] for c in all_chunks]
-                    all_vectors = []
-
-                    status_text.text(f"Generating embeddings via '{model_name}' on {primary_url}...")
-                    for i in range(0, len(texts), embed_batch_size):
-                        batch = texts[i : i + embed_batch_size]
-                        vectors = get_batch_embeddings(primary_client, batch)
-                        all_vectors.extend(vectors)
-                        prog_bar.progress(min(1.0, (i + embed_batch_size) / len(texts)))
-
-                    status_text.text("Bulk indexing vectors into OpenSearch...")
-                    actions = [
-                        {
-                            "_index": index_name,
-                            "_source": {
-                                "filename": all_chunks[i]["filename"],
-                                "page": all_chunks[i]["page"],
-                                "chunk_id": all_chunks[i]["chunk_id"],
-                                "title": all_chunks[i]["title"],
-                                "content": all_chunks[i]["content"],
-                                "embedding": all_vectors[i]
-                            }
-                        }
-                        for i in range(len(all_chunks))
-                    ]
+                if create_index():
+                    prog_bar = st.progress(0)
+                    status_text = st.empty()
                     
-                    success_count, _ = helpers.bulk(os_client, actions)
-                    total_time = time.perf_counter() - start_time
-                    prog_bar.progress(1.0)
-                    status_text.empty()
-                    st.success(f"🎉 Successfully ingested **{success_count}** chunks into '{index_name}' in **{total_time:.2f}s** ({(success_count/total_time):.1f} chunks/sec)!")
-                except Exception as e:
-                    st.error(f"Ingestion failed: {e}")
+                    try:
+                        start_time = time.perf_counter()
+                        texts = [c["content"] for c in all_chunks]
+                        all_vectors = []
+
+                        status_text.text(f"Generating embeddings via '{model_name}' on {primary_url}...")
+                        for i in range(0, len(texts), embed_batch_size):
+                            batch = texts[i : i + embed_batch_size]
+                            vectors = get_batch_embeddings(primary_client, batch)
+                            all_vectors.extend(vectors)
+                            prog_bar.progress(min(1.0, (i + embed_batch_size) / len(texts)))
+
+                        status_text.text("Bulk indexing vectors into OpenSearch...")
+                        actions = [
+                            {
+                                "_index": index_name,
+                                "_source": {
+                                    "filename": all_chunks[i]["filename"],
+                                    "page": all_chunks[i]["page"],
+                                    "chunk_id": all_chunks[i]["chunk_id"],
+                                    "title": all_chunks[i]["title"],
+                                    "content": all_chunks[i]["content"],
+                                    "embedding": all_vectors[i]
+                                }
+                            }
+                            for i in range(len(all_chunks))
+                        ]
+                        
+                        success_count, _ = helpers.bulk(os_client, actions)
+                        total_time = time.perf_counter() - start_time
+                        prog_bar.progress(1.0)
+                        status_text.empty()
+                        st.success(f"🎉 Successfully ingested **{success_count}** chunks into '{index_name}' in **{total_time:.2f}s** ({(success_count/total_time):.1f} chunks/sec)!")
+                    except Exception as e:
+                        st.error(f"Ingestion failed: {e}")
 
     elif upload_mode == "📝 Custom Text":
         doc_title = st.text_input("Document Title")
@@ -336,24 +338,24 @@ with tab_ingest:
             if not doc_content.strip():
                 st.warning("Please provide document content.")
             else:
-                try:
-                    create_index()
-                    with st.spinner("Generating embedding..."):
-                        vec = get_single_embedding(primary_client, doc_content)
-                        os_client.index(
-                            index=index_name,
-                            body={
-                                "filename": "manual_entry.txt",
-                                "page": 1,
-                                "chunk_id": 1,
-                                "title": doc_title or "Untitled",
-                                "content": doc_content,
-                                "embedding": vec
-                            }
-                        )
-                    st.success(f"Indexed document: '{doc_title}'")
-                except Exception as e:
-                    st.error(f"Error indexing document: {e}")
+                if create_index():
+                    try:
+                        with st.spinner("Generating embedding..."):
+                            vec = get_single_embedding(primary_client, doc_content)
+                            os_client.index(
+                                index=index_name,
+                                body={
+                                    "filename": "manual_entry.txt",
+                                    "page": 1,
+                                    "chunk_id": 1,
+                                    "title": doc_title or "Untitled",
+                                    "content": doc_content,
+                                    "embedding": vec
+                                }
+                            )
+                        st.success(f"Indexed document: '{doc_title}'")
+                    except Exception as e:
+                        st.error(f"Error indexing document: {e}")
 
 # --- SEARCH & CHUNK RETRIEVAL TAB ---
 with tab_search:
@@ -434,114 +436,75 @@ with tab_search:
                                 st.info(content)
                                 st.divider()
             except Exception as e:
-                st.error(f"Search failed: {e}. Check if the index exists and if '{primary_url}' is accessible.")
+                st.error(f"Search failed: {e}. Check if the index exists and if OpenSearch is accessible.")
 
 # --- BENCHMARK TAB ---
 with tab_benchmark:
-    st.subheader("⚡ Performance Benchmark: Spyre Card vs. Power CPU")
+    st.subheader("⚡ Performance & Batching Benchmark")
     st.write(
-        "Generate embeddings across a batch of documents to compare throughput (docs/sec) and latency between "
-        "the **IBM Spyre PCIe Accelerator** and **Power CPU**."
+        f"Benchmark embedding throughput (chunks/sec) and latency of **'{model_name}'** on **{primary_url}** across different batch sizes."
     )
 
     bench_source = st.radio("Benchmark Dataset Source:", ["📚 Real PDF Chunks from `./Files`", "🧪 Synthetic Corpus"], horizontal=True)
 
-    col_cfg1, col_cfg2, col_cfg3 = st.columns(3)
+    col_cfg1, col_cfg2 = st.columns(2)
     with col_cfg1:
         if bench_source == "🧪 Synthetic Corpus":
-            num_docs = st.select_slider("Number of Documents", options=[10, 50, 100, 200, 500, 1000], value=100)
+            num_docs = st.select_slider("Number of Documents", options=[10, 50, 100, 200, 500], value=50)
         else:
-            num_docs = st.number_input("Max PDF Chunks to Benchmark", min_value=10, max_value=2000, value=100, step=10)
+            num_docs = st.number_input("Max PDF Chunks to Benchmark", min_value=10, max_value=1000, value=50, step=10)
     with col_cfg2:
-        batch_size = st.selectbox("Inference Batch Size", options=[8, 16, 32, 64], index=1, key="bench_batch_size")
-    with col_cfg3:
-        target_mode = st.radio("Benchmark Target", ["Both (Compare Primary vs Secondary/CPU)", "Primary Only", "Secondary/CPU Only"])
-
-    if bench_source == "📚 Real PDF Chunks from `./Files`" and local_pdfs:
-        corpus = load_all_local_pdf_chunks(chunk_size=500, chunk_overlap=100)[:int(num_docs)]
-    else:
-        corpus = generate_benchmark_corpus(int(num_docs))
-    
-    with st.expander(f"Preview Benchmark Corpus ({len(corpus)} docs/chunks)"):
-        st.dataframe(pd.DataFrame(corpus)[["filename", "page", "chunk_id", "content"] if "page" in corpus[0] else ["id", "title", "content"]].head(10), use_container_width=True)
+        batch_sizes_to_test = st.multiselect("Batch Sizes to Test", [1, 8, 16, 32, 64], default=[1, 16, 32])
 
     if st.button("▶️ Run Embedding Benchmark", type="primary"):
-        texts = [doc["content"] for doc in corpus]
-        total_items = len(texts)
-        results = {}
+        if not batch_sizes_to_test:
+            st.warning("Please select at least one batch size to test.")
+        else:
+            if bench_source == "📚 Real PDF Chunks from `./Files`" and local_pdfs:
+                corpus = load_all_local_pdf_chunks(chunk_size=500, chunk_overlap=100)[:int(num_docs)]
+            else:
+                corpus = generate_benchmark_corpus(int(num_docs))
 
-        if target_mode in ["Both (Compare Primary vs Secondary/CPU)", "Secondary/CPU Only"]:
-            st.info(f"⏳ Running Secondary / CPU Benchmark ({total_items} items via {cpu_url})...")
-            cpu_progress = st.progress(0)
-            cpu_start = time.perf_counter()
-            
-            try:
-                for i in range(0, len(texts), batch_size):
-                    batch = texts[i : i + batch_size]
-                    get_batch_embeddings(cpu_client, batch)
-                    cpu_progress.progress(min(1.0, (i + batch_size) / len(texts)))
-                cpu_total_time = time.perf_counter() - cpu_start
-                results["Secondary / CPU"] = {
-                    "time": cpu_total_time,
-                    "throughput": total_items / cpu_total_time,
-                    "latency_per_doc_ms": (cpu_total_time / total_items) * 1000
-                }
-            except Exception as e:
-                st.error(f"CPU Benchmark failed: {e}")
+            texts = [doc["content"] for doc in corpus]
+            total_items = len(texts)
+            results = []
 
-        if target_mode in ["Both (Compare Primary vs Secondary/CPU)", "Primary Only"]:
-            st.info(f"⏳ Running Primary Accelerator Benchmark ({total_items} items via {primary_url})...")
-            primary_progress = st.progress(0)
-            primary_start = time.perf_counter()
-            
-            try:
-                for i in range(0, len(texts), batch_size):
-                    batch = texts[i : i + batch_size]
-                    get_batch_embeddings(primary_client, batch)
-                    primary_progress.progress(min(1.0, (i + batch_size) / len(texts)))
-                primary_total_time = time.perf_counter() - primary_start
-                results["Primary (Spyre/Ollama)"] = {
-                    "time": primary_total_time,
-                    "throughput": total_items / primary_total_time,
-                    "latency_per_doc_ms": (primary_total_time / total_items) * 1000
-                }
-            except Exception as e:
-                st.error(f"Primary Benchmark failed: {e}")
-
-        if results:
-            st.success("✅ Benchmark Completed!")
-            col_m1, col_m2, col_m3 = st.columns(3)
-            
-            if "Secondary / CPU" in results and "Primary (Spyre/Ollama)" in results:
-                cpu_tp = results["Secondary / CPU"]["throughput"]
-                spyre_tp = results["Primary (Spyre/Ollama)"]["throughput"]
-                speedup = spyre_tp / cpu_tp if cpu_tp > 0 else 0
+            for bs in batch_sizes_to_test:
+                st.info(f"⏳ Running Benchmark with Batch Size = {bs} ({total_items} items)...")
+                prog = st.progress(0)
+                start_t = time.perf_counter()
                 
-                col_m1.metric("Secondary / CPU Throughput", f"{cpu_tp:.1f} chunks/sec", f"{results['Secondary / CPU']['time']:.2f}s total")
-                col_m2.metric("Primary Accelerator Throughput", f"{spyre_tp:.1f} chunks/sec", f"{results['Primary (Spyre/Ollama)']['time']:.2f}s total")
-                col_m3.metric("Acceleration Factor", f"{speedup:.2f}x", delta=f"+{((speedup-1)*100):.1f}%" if speedup > 1 else "N/A")
-            elif "Primary (Spyre/Ollama)" in results:
-                spyre_tp = results["Primary (Spyre/Ollama)"]["throughput"]
-                col_m1.metric("Throughput", f"{spyre_tp:.1f} chunks/sec")
-                col_m2.metric("Total Time", f"{results['Primary (Spyre/Ollama)']['time']:.2f}s")
-                col_m3.metric("Latency per Chunk", f"{results['Primary (Spyre/Ollama)']['latency_per_doc_ms']:.2f} ms")
-            elif "Secondary / CPU" in results:
-                cpu_tp = results["Secondary / CPU"]["throughput"]
-                col_m1.metric("Throughput", f"{cpu_tp:.1f} chunks/sec")
-                col_m2.metric("Total Time", f"{results['Secondary / CPU']['time']:.2f}s")
-                col_m3.metric("Latency per Chunk", f"{results['Secondary / CPU']['latency_per_doc_ms']:.2f} ms")
+                try:
+                    for i in range(0, len(texts), bs):
+                        batch = texts[i : i + bs]
+                        get_batch_embeddings(primary_client, batch)
+                        prog.progress(min(1.0, (i + bs) / len(texts)))
+                    total_t = time.perf_counter() - start_t
+                    tp = total_items / total_t
+                    lat = (total_t / total_items) * 1000
+                    results.append({
+                        "Batch Size": f"Batch {bs}",
+                        "Throughput (chunks/sec)": round(tp, 2),
+                        "Total Time (s)": round(total_t, 2),
+                        "Latency per chunk (ms)": round(lat, 2)
+                    })
+                except Exception as e:
+                    st.error(f"Benchmark failed for Batch Size {bs}: {e}")
 
-            df_results = pd.DataFrame(results).T.reset_index().rename(columns={"index": "Hardware Target"})
-            st.markdown("### 📊 Performance Comparison")
-            c1, c2 = st.columns(2)
-            with c1:
-                st.write("**Throughput (Chunks / Second - Higher is Better)**")
-                st.bar_chart(df_results.set_index("Hardware Target")["throughput"])
-            with c2:
-                st.write("**Total Time (Seconds - Lower is Better)**")
-                st.bar_chart(df_results.set_index("Hardware Target")["time"])
+            if results:
+                st.success("✅ Benchmark Completed!")
+                df_res = pd.DataFrame(results)
+                
+                st.markdown("### 📊 Performance Results")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.write("**Throughput (Chunks / Second - Higher is Better)**")
+                    st.bar_chart(df_res.set_index("Batch Size")["Throughput (chunks/sec)"])
+                with c2:
+                    st.write("**Latency per Chunk (ms - Lower is Better)**")
+                    st.bar_chart(df_res.set_index("Batch Size")["Latency per chunk (ms)"])
 
-            st.dataframe(df_results, use_container_width=True)
+                st.dataframe(df_res, use_container_width=True)
 
 # --- ADMIN TAB ---
 with tab_admin:
@@ -549,10 +512,7 @@ with tab_admin:
     col1, col2 = st.columns(2)
     with col1:
         if st.button("Create / Verify k-NN Index"):
-            try:
-                create_index()
-            except Exception as e:
-                st.error(f"Failed to create index: {e}")
+            create_index()
     with col2:
         if st.button("Delete Index", type="secondary"):
             try:
