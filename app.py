@@ -10,17 +10,17 @@ from opensearchpy import OpenSearch, helpers
 
 st.set_page_config(page_title="IBM Power VectorDB Lab", layout="wide")
 
-st.title("⚡ VectorDB Lab on IBM Power with OpenSearch & vLLM")
-st.caption("Demonstrating PDF ingestion (`Files/hybrid_cloud.pdf`, `Files/spyre_redbook.pdf`), OpenAI-compatible embedding models on IBM Power (ppc64le) / Spyre cards, and OpenSearch k-NN chunk retrieval.")
+st.title("⚡ VectorDB Lab on IBM Power with OpenSearch & Ollama/vLLM")
+st.caption("Demonstrating PDF ingestion (`Files/hybrid_cloud.pdf`, `Files/spyre_redbook.pdf`), IBM Granite Embedding models on IBM Power (ppc64le), and OpenSearch k-NN chunk retrieval.")
 
 # Sidebar Configuration
 with st.sidebar:
     st.header("🔧 Endpoints Configuration")
     
     st.subheader("Inference Endpoints")
-    spyre_url = st.text_input("Spyre vLLM Base URL", value="http://localhost:8000/v1")
-    cpu_url = st.text_input("Power CPU (vLLM/Ollama) Base URL", value="http://localhost:8001/v1")
-    model_name = st.text_input("Embedding Model", value="BAAI/bge-small-en-v1.5")
+    primary_url = st.text_input("Embedding Base URL (Ollama / vLLM)", value="http://localhost:11434/v1")
+    cpu_url = st.text_input("Secondary / CPU Base URL (for Benchmark)", value="http://localhost:8001/v1")
+    model_name = st.text_input("Embedding Model", value="granite-embedding")
     dimension = st.number_input("Vector Dimension", min_value=64, max_value=4096, value=384)
 
     st.subheader("OpenSearch Database")
@@ -30,13 +30,31 @@ with st.sidebar:
 
     st.divider()
     st.markdown("📁 **Lab Data Directory:** `./Files`")
-    local_pdf_files = glob.glob("Files/*.pdf") + glob.glob("files/*.pdf")
+    local_pdf_files = sorted(glob.glob("Files/*.pdf") + glob.glob("files/*.pdf"))
     if local_pdf_files:
         st.success(f"Found {len(local_pdf_files)} PDF(s) in `./Files`")
         for f in local_pdf_files:
             st.caption(f"• `{os.path.basename(f)}`")
     else:
         st.warning("No PDFs found in `./Files`")
+
+    st.divider()
+    if st.button("🔌 Test Connections"):
+        # Test Embedding endpoint
+        try:
+            test_client = OpenAI(base_url=primary_url, api_key="not-needed", timeout=5.0)
+            res = test_client.embeddings.create(model=model_name, input="ping")
+            st.success(f"✅ Embedding endpoint OK (Dim: {len(res.data[0].embedding)})")
+        except Exception as e:
+            st.error(f"❌ Embedding endpoint error ({primary_url}): {e}")
+
+        # Test OpenSearch
+        try:
+            test_os = OpenSearch(hosts=[{"host": opensearch_host, "port": int(opensearch_port)}], use_ssl=False, verify_certs=False, timeout=5)
+            info = test_os.info()
+            st.success(f"✅ OpenSearch OK (Cluster: {info.get('cluster_name', 'connected')})")
+        except Exception as e:
+            st.error(f"❌ OpenSearch error ({opensearch_host}:{opensearch_port}): {e}")
 
 # Initialize Clients
 @st.cache_resource
@@ -50,7 +68,7 @@ def get_opensearch_client(host: str, port: int):
         verify_certs=False
     )
 
-spyre_client = get_openai_client(spyre_url)
+primary_client = get_openai_client(primary_url)
 cpu_client = get_openai_client(cpu_url)
 os_client = get_opensearch_client(opensearch_host, opensearch_port)
 
@@ -101,7 +119,7 @@ def create_index():
     else:
         st.info(f"Index '{index_name}' already exists.")
 
-# PDF Chunking Utilities supporting both File Path and UploadedFile stream
+# PDF Chunking Utilities
 def extract_chunks_from_pdf(source, chunk_size: int = 500, chunk_overlap: int = 100) -> list[dict]:
     if isinstance(source, str):
         filename = os.path.basename(source)
@@ -120,13 +138,12 @@ def extract_chunks_from_pdf(source, chunk_size: int = 500, chunk_overlap: int = 
         if not text:
             continue
             
-        # Sliding window chunking
         start = 0
         while start < len(text):
             end = min(start + chunk_size, len(text))
             chunk_content = text[start:end]
             
-            if len(chunk_content.strip()) > 30:  # Skip tiny noise
+            if len(chunk_content.strip()) > 30:
                 chunk_counter += 1
                 chunks.append({
                     "filename": filename,
@@ -142,7 +159,6 @@ def extract_chunks_from_pdf(source, chunk_size: int = 500, chunk_overlap: int = 
 
     return chunks
 
-# Load chunks from all local PDFs in Files/
 def load_all_local_pdf_chunks(chunk_size: int = 500, chunk_overlap: int = 100) -> list[dict]:
     pdf_paths = sorted(glob.glob("Files/*.pdf") + glob.glob("files/*.pdf"))
     all_chunks = []
@@ -151,17 +167,16 @@ def load_all_local_pdf_chunks(chunk_size: int = 500, chunk_overlap: int = 100) -
         all_chunks.extend(chunks)
     return all_chunks
 
-# Corpus Generator for Benchmarking
 def generate_benchmark_corpus(num_docs: int) -> list[dict]:
     topics = [
         ("IBM Power10 MMA", "IBM Power10 incorporates Matrix Math Accelerator (MMA) units directly into each core to accelerate in-core AI operations with low latency."),
         ("IBM Spyre Card", "The IBM Spyre accelerator is a specialized PCIe card designed to provide high-density neural network inference and embedding processing on Power systems."),
         ("OpenSearch k-NN", "OpenSearch vector engine leverages HNSW graph-based indexing to deliver millisecond-level approximate nearest neighbor queries over massive document sets."),
-        ("vLLM Continuous Batching", "vLLM employs PagedAttention and continuous batching to maximize hardware saturation and achieve maximum throughput for concurrent embedding requests."),
+        ("Granite Embeddings", "IBM Granite embedding models provide enterprise-grade semantic representations optimized for hybrid cloud and retrieval-augmented generation."),
+        ("Continuous Batching", "PagedAttention and continuous batching maximize hardware saturation and achieve maximum throughput for concurrent embedding requests."),
         ("Hybrid Search Retrieval", "Combining dense vector representations with sparse BM25 keyword matching provides optimal precision and recall for enterprise retrieval-augmented generation."),
         ("PowerVM Virtualization", "IBM PowerVM enables dynamic resource allocation and partition mobility, allowing AI workloads to scale across virtualized Linux ppc64le environments."),
-        ("Enterprise Vector Storage", "Storing embeddings alongside relational metadata allows filtered vector similarity search across secure enterprise domains."),
-        ("PCIe Gen5 Bandwidth", "High-speed PCIe bus architecture ensures fast transfer of embedding vectors between the host Power memory and the Spyre accelerator.")
+        ("Enterprise Vector Storage", "Storing embeddings alongside relational metadata allows filtered vector similarity search across secure enterprise domains.")
     ]
     
     docs = []
@@ -178,39 +193,191 @@ def generate_benchmark_corpus(num_docs: int) -> list[dict]:
         docs.append(doc)
     return docs
 
-# Main Interface Tabs
-tab_search, tab_ingest, tab_benchmark, tab_admin = st.tabs([
-    "🔍 Ask Questions & Retrieve Chunks",
+# Main Interface Tabs (Ingestion First)
+tab_ingest, tab_search, tab_benchmark, tab_admin = st.tabs([
     "📥 Ingest PDFs & Documents",
+    "🔍 Ask Questions & Retrieve Chunks",
     "🚀 Benchmark (Spyre vs CPU)", 
     "⚙️ Index Admin"
 ])
+
+# --- INGESTION TAB ---
+with tab_ingest:
+    st.subheader("📥 Document Ingestion & Chunking")
+
+    local_pdfs = sorted(glob.glob("Files/*.pdf") + glob.glob("files/*.pdf"))
+    
+    col_c1, col_c2, col_c3 = st.columns(3)
+    with col_c1:
+        chunk_size = st.slider("Chunk Size (characters)", min_value=200, max_value=2000, value=600, step=50)
+    with col_c2:
+        chunk_overlap = st.slider("Chunk Overlap (characters)", min_value=0, max_value=500, value=100, step=25)
+    with col_c3:
+        embed_batch_size = st.selectbox("Embedding Batch Size", [8, 16, 32, 64], index=1)
+
+    st.markdown("---")
+    upload_mode = st.radio("Choose Ingestion Source:", ["📚 Ingest Local Folder (`./Files`)", "📤 Upload Custom PDF(s)", "📝 Custom Text"], horizontal=True)
+
+    if upload_mode == "📚 Ingest Local Folder (`./Files`)":
+        st.write(f"The lab detected **{len(local_pdfs)}** PDF(s) in `./Files`:")
+        for pdf_path in local_pdfs:
+            st.markdown(f"- 📄 **`{pdf_path}`**")
+
+        if local_pdfs:
+            if st.button("🚀 Ingest All PDFs from `./Files`", type="primary"):
+                create_index()
+                prog_bar = st.progress(0)
+                status_text = st.empty()
+                
+                try:
+                    start_time = time.perf_counter()
+                    status_text.text("Extracting and chunking text from local PDFs...")
+                    all_chunks = load_all_local_pdf_chunks(chunk_size, chunk_overlap)
+                    st.write(f"📊 Extracted **{len(all_chunks)}** chunks across local PDFs.")
+                    
+                    texts = [c["content"] for c in all_chunks]
+                    all_vectors = []
+
+                    status_text.text(f"Generating embeddings via '{model_name}' on {primary_url}...")
+                    for i in range(0, len(texts), embed_batch_size):
+                        batch = texts[i : i + embed_batch_size]
+                        vectors = get_batch_embeddings(primary_client, batch)
+                        all_vectors.extend(vectors)
+                        prog_bar.progress(min(1.0, (i + embed_batch_size) / len(texts)))
+
+                    status_text.text("Bulk indexing vectors into OpenSearch...")
+                    actions = [
+                        {
+                            "_index": index_name,
+                            "_source": {
+                                "filename": all_chunks[i]["filename"],
+                                "page": all_chunks[i]["page"],
+                                "chunk_id": all_chunks[i]["chunk_id"],
+                                "title": all_chunks[i]["title"],
+                                "content": all_chunks[i]["content"],
+                                "embedding": all_vectors[i]
+                            }
+                        }
+                        for i in range(len(all_chunks))
+                    ]
+                    
+                    success_count, _ = helpers.bulk(os_client, actions)
+                    total_time = time.perf_counter() - start_time
+                    prog_bar.progress(1.0)
+                    status_text.empty()
+                    st.success(f"🎉 Successfully ingested **{success_count}** chunks from `./Files` into '{index_name}' in **{total_time:.2f}s** ({(success_count/total_time):.1f} chunks/sec)!")
+                    
+                    with st.expander("Preview Ingested Chunks"):
+                        st.dataframe(pd.DataFrame(all_chunks)[["filename", "page", "chunk_id", "content"]].head(20), use_container_width=True)
+                except Exception as e:
+                    st.error(f"Ingestion failed: {e}")
+        else:
+            st.warning("No PDF files found in `./Files`.")
+
+    elif upload_mode == "📤 Upload Custom PDF(s)":
+        uploaded_files = st.file_uploader("Upload PDF(s)", type=["pdf"], accept_multiple_files=True)
+
+        if uploaded_files:
+            all_chunks = []
+            for file in uploaded_files:
+                file_chunks = extract_chunks_from_pdf(file, chunk_size, chunk_overlap)
+                all_chunks.extend(file_chunks)
+
+            st.write(f"📊 Extracted **{len(all_chunks)}** chunks across **{len(uploaded_files)}** file(s).")
+            with st.expander("Preview Extracted Chunks"):
+                st.dataframe(pd.DataFrame(all_chunks)[["filename", "page", "chunk_id", "content"]].head(15), use_container_width=True)
+
+            if st.button("🚀 Embed & Ingest Uploaded PDF Chunks", type="primary"):
+                create_index()
+                prog_bar = st.progress(0)
+                status_text = st.empty()
+                
+                try:
+                    start_time = time.perf_counter()
+                    texts = [c["content"] for c in all_chunks]
+                    all_vectors = []
+
+                    status_text.text(f"Generating embeddings via '{model_name}' on {primary_url}...")
+                    for i in range(0, len(texts), embed_batch_size):
+                        batch = texts[i : i + embed_batch_size]
+                        vectors = get_batch_embeddings(primary_client, batch)
+                        all_vectors.extend(vectors)
+                        prog_bar.progress(min(1.0, (i + embed_batch_size) / len(texts)))
+
+                    status_text.text("Bulk indexing vectors into OpenSearch...")
+                    actions = [
+                        {
+                            "_index": index_name,
+                            "_source": {
+                                "filename": all_chunks[i]["filename"],
+                                "page": all_chunks[i]["page"],
+                                "chunk_id": all_chunks[i]["chunk_id"],
+                                "title": all_chunks[i]["title"],
+                                "content": all_chunks[i]["content"],
+                                "embedding": all_vectors[i]
+                            }
+                        }
+                        for i in range(len(all_chunks))
+                    ]
+                    
+                    success_count, _ = helpers.bulk(os_client, actions)
+                    total_time = time.perf_counter() - start_time
+                    prog_bar.progress(1.0)
+                    status_text.empty()
+                    st.success(f"🎉 Successfully ingested **{success_count}** chunks into '{index_name}' in **{total_time:.2f}s** ({(success_count/total_time):.1f} chunks/sec)!")
+                except Exception as e:
+                    st.error(f"Ingestion failed: {e}")
+
+    elif upload_mode == "📝 Custom Text":
+        doc_title = st.text_input("Document Title")
+        doc_content = st.text_area("Document Content")
+
+        if st.button("Embed & Store Document"):
+            if not doc_content.strip():
+                st.warning("Please provide document content.")
+            else:
+                try:
+                    create_index()
+                    with st.spinner("Generating embedding..."):
+                        vec = get_single_embedding(primary_client, doc_content)
+                        os_client.index(
+                            index=index_name,
+                            body={
+                                "filename": "manual_entry.txt",
+                                "page": 1,
+                                "chunk_id": 1,
+                                "title": doc_title or "Untitled",
+                                "content": doc_content,
+                                "embedding": vec
+                            }
+                        )
+                    st.success(f"Indexed document: '{doc_title}'")
+                except Exception as e:
+                    st.error(f"Error indexing document: {e}")
 
 # --- SEARCH & CHUNK RETRIEVAL TAB ---
 with tab_search:
     st.subheader("🔍 Ask Questions & Retrieve Context Chunks")
     st.write("Query your vector database in natural language. OpenSearch retrieves the most semantically relevant chunks with similarity scores.")
 
-    # Quick sample question buttons for the provided PDFs
+    if "selected_query" not in st.session_state:
+        st.session_state.selected_query = "What is the IBM Spyre accelerator card designed for?"
+
     st.write("**Suggested Sample Questions for `./Files`:**")
     sample_col1, sample_col2 = st.columns(2)
     sample_col3, sample_col4 = st.columns(2)
-    
-    if "selected_query" not in st.session_state:
-        st.session_state.selected_query = "What are the capabilities of the IBM Spyre accelerator card?"
 
-    if sample_col1.button("💡 What is the IBM Spyre card designed for?"):
-        st.session_state.selected_query = "What is the IBM Spyre accelerator card designed for and how does it accelerate AI inference?"
-    if sample_col2.button("💡 How does IBM Power support hybrid cloud?"):
-        st.session_state.selected_query = "How does IBM Power support hybrid cloud architectures and enterprise workloads?"
-    if sample_col3.button("💡 What models run on Spyre accelerators?"):
-        st.session_state.selected_query = "What AI models and LLM architectures are supported on IBM Spyre cards?"
-    if sample_col4.button("💡 What is PowerVM and how does it provide security?"):
-        st.session_state.selected_query = "What is PowerVM virtualization and how does it ensure security and isolation for cloud deployments?"
+    def set_query(q):
+        st.session_state.selected_query = q
+
+    sample_col1.button("💡 What is the IBM Spyre card designed for?", on_click=set_query, args=("What is the IBM Spyre accelerator card designed for and how does it accelerate AI inference?",))
+    sample_col2.button("💡 How does IBM Power support hybrid cloud?", on_click=set_query, args=("How does IBM Power support hybrid cloud architectures and enterprise workloads?",))
+    sample_col3.button("💡 What models run on Spyre accelerators?", on_click=set_query, args=("What AI models and LLM architectures are supported on IBM Spyre cards?",))
+    sample_col4.button("💡 What is PowerVM security?", on_click=set_query, args=("What is PowerVM virtualization and how does it ensure security and isolation for cloud deployments?",))
 
     col_q, col_k = st.columns([4, 1])
     with col_q:
-        query_text = st.text_input("Ask a question / enter query:", value=st.session_state.selected_query)
+        query_text = st.text_input("Ask a question / enter query:", value=st.session_state.selected_query, key="query_input")
     with col_k:
         top_k = st.number_input("Top K Chunks", min_value=1, max_value=20, value=4)
 
@@ -221,9 +388,9 @@ with tab_search:
             st.warning("Please enter a question or query.")
         else:
             try:
-                with st.spinner("Embedding query via Spyre vLLM and searching OpenSearch..."):
+                with st.spinner(f"Embedding query via '{model_name}' and querying OpenSearch..."):
                     query_start = time.perf_counter()
-                    query_vector = get_single_embedding(spyre_client, query_text)
+                    query_vector = get_single_embedding(primary_client, query_text)
                     embed_time = time.perf_counter() - query_start
 
                     search_start = time.perf_counter()
@@ -267,162 +434,7 @@ with tab_search:
                                 st.info(content)
                                 st.divider()
             except Exception as e:
-                st.error(f"Search failed: {e}")
-
-# --- INGESTION TAB ---
-with tab_ingest:
-    st.subheader("📥 Document Ingestion & Chunking")
-
-    # Detect local Files/
-    local_pdfs = sorted(glob.glob("Files/*.pdf") + glob.glob("files/*.pdf"))
-    
-    col_c1, col_c2, col_c3 = st.columns(3)
-    with col_c1:
-        chunk_size = st.slider("Chunk Size (characters)", min_value=200, max_value=2000, value=600, step=50)
-    with col_c2:
-        chunk_overlap = st.slider("Chunk Overlap (characters)", min_value=0, max_value=500, value=100, step=25)
-    with col_c3:
-        embed_batch_size = st.selectbox("Embedding Batch Size", [8, 16, 32, 64], index=1)
-
-    st.markdown("---")
-    upload_mode = st.radio("Choose Ingestion Source:", ["📚 Ingest Local Folder (`./Files`)", "📤 Upload Custom PDF(s)", "📝 Custom Text"], horizontal=True)
-
-    if upload_mode == "📚 Ingest Local Folder (`./Files`)":
-        st.write(f"The lab detected **{len(local_pdfs)}** PDF(s) in the `./Files` directory:")
-        for pdf_path in local_pdfs:
-            st.markdown(f"- 📄 **`{pdf_path}`**")
-
-        if local_pdfs:
-            if st.button("🚀 Ingest All PDFs from `./Files`", type="primary"):
-                create_index()
-                prog_bar = st.progress(0)
-                status_text = st.empty()
-                
-                try:
-                    start_time = time.perf_counter()
-                    status_text.text("Extracting and chunking text from local PDFs...")
-                    all_chunks = load_all_local_pdf_chunks(chunk_size, chunk_overlap)
-                    st.write(f"📊 Extracted **{len(all_chunks)}** chunks across local PDFs.")
-                    
-                    texts = [c["content"] for c in all_chunks]
-                    all_vectors = []
-
-                    status_text.text("Generating embeddings via Spyre vLLM...")
-                    for i in range(0, len(texts), embed_batch_size):
-                        batch = texts[i : i + embed_batch_size]
-                        vectors = get_batch_embeddings(spyre_client, batch)
-                        all_vectors.extend(vectors)
-                        prog_bar.progress(min(1.0, (i + embed_batch_size) / len(texts)))
-
-                    status_text.text("Bulk indexing vectors into OpenSearch...")
-                    actions = [
-                        {
-                            "_index": index_name,
-                            "_source": {
-                                "filename": all_chunks[i]["filename"],
-                                "page": all_chunks[i]["page"],
-                                "chunk_id": all_chunks[i]["chunk_id"],
-                                "title": all_chunks[i]["title"],
-                                "content": all_chunks[i]["content"],
-                                "embedding": all_vectors[i]
-                            }
-                        }
-                        for i in range(len(all_chunks))
-                    ]
-                    
-                    success_count, _ = helpers.bulk(os_client, actions)
-                    total_time = time.perf_counter() - start_time
-                    prog_bar.progress(1.0)
-                    status_text.empty()
-                    st.success(f"🎉 Successfully ingested **{success_count}** chunks from `./Files` into '{index_name}' in **{total_time:.2f}s** ({(success_count/total_time):.1f} chunks/sec)!")
-                    
-                    with st.expander("Preview Ingested Chunks"):
-                        st.dataframe(pd.DataFrame(all_chunks)[["filename", "page", "chunk_id", "content"]].head(20), use_container_width=True)
-                except Exception as e:
-                    st.error(f"Ingestion failed: {e}")
-        else:
-            st.warning("No PDF files found in `./Files`. Place PDF files in the `./Files` folder or use the custom upload option.")
-
-    elif upload_mode == "📤 Upload Custom PDF(s)":
-        uploaded_files = st.file_uploader("Upload PDF(s)", type=["pdf"], accept_multiple_files=True)
-
-        if uploaded_files:
-            all_chunks = []
-            for file in uploaded_files:
-                file_chunks = extract_chunks_from_pdf(file, chunk_size, chunk_overlap)
-                all_chunks.extend(file_chunks)
-
-            st.write(f"📊 Extracted **{len(all_chunks)}** chunks across **{len(uploaded_files)}** file(s).")
-            with st.expander("Preview Extracted Chunks"):
-                st.dataframe(pd.DataFrame(all_chunks)[["filename", "page", "chunk_id", "content"]].head(15), use_container_width=True)
-
-            if st.button("🚀 Embed & Ingest Uploaded PDF Chunks", type="primary"):
-                create_index()
-                prog_bar = st.progress(0)
-                status_text = st.empty()
-                
-                try:
-                    start_time = time.perf_counter()
-                    texts = [c["content"] for c in all_chunks]
-                    all_vectors = []
-
-                    status_text.text("Generating embeddings via Spyre vLLM...")
-                    for i in range(0, len(texts), embed_batch_size):
-                        batch = texts[i : i + embed_batch_size]
-                        vectors = get_batch_embeddings(spyre_client, batch)
-                        all_vectors.extend(vectors)
-                        prog_bar.progress(min(1.0, (i + embed_batch_size) / len(texts)))
-
-                    status_text.text("Bulk indexing vectors into OpenSearch...")
-                    actions = [
-                        {
-                            "_index": index_name,
-                            "_source": {
-                                "filename": all_chunks[i]["filename"],
-                                "page": all_chunks[i]["page"],
-                                "chunk_id": all_chunks[i]["chunk_id"],
-                                "title": all_chunks[i]["title"],
-                                "content": all_chunks[i]["content"],
-                                "embedding": all_vectors[i]
-                            }
-                        }
-                        for i in range(len(all_chunks))
-                    ]
-                    
-                    success_count, _ = helpers.bulk(os_client, actions)
-                    total_time = time.perf_counter() - start_time
-                    prog_bar.progress(1.0)
-                    status_text.empty()
-                    st.success(f"🎉 Successfully ingested **{success_count}** chunks into '{index_name}' in **{total_time:.2f}s** ({(success_count/total_time):.1f} chunks/sec)!")
-                except Exception as e:
-                    st.error(f"Ingestion failed: {e}")
-
-    elif upload_mode == "📝 Custom Text":
-        doc_title = st.text_input("Document Title")
-        doc_content = st.text_area("Document Content")
-
-        if st.button("Embed & Store Document"):
-            if not doc_content.strip():
-                st.warning("Please provide document content.")
-            else:
-                try:
-                    create_index()
-                    with st.spinner("Generating embedding via Spyre vLLM..."):
-                        vec = get_single_embedding(spyre_client, doc_content)
-                        os_client.index(
-                            index=index_name,
-                            body={
-                                "filename": "manual_entry.txt",
-                                "page": 1,
-                                "chunk_id": 1,
-                                "title": doc_title or "Untitled",
-                                "content": doc_content,
-                                "embedding": vec
-                            }
-                        )
-                    st.success(f"Indexed document: '{doc_title}'")
-                except Exception as e:
-                    st.error(f"Error indexing document: {e}")
+                st.error(f"Search failed: {e}. Check if the index exists and if '{primary_url}' is accessible.")
 
 # --- BENCHMARK TAB ---
 with tab_benchmark:
@@ -443,7 +455,7 @@ with tab_benchmark:
     with col_cfg2:
         batch_size = st.selectbox("Inference Batch Size", options=[8, 16, 32, 64], index=1, key="bench_batch_size")
     with col_cfg3:
-        target_mode = st.radio("Benchmark Target", ["Both (Compare Spyre vs CPU)", "Spyre Only", "CPU Only"])
+        target_mode = st.radio("Benchmark Target", ["Both (Compare Primary vs Secondary/CPU)", "Primary Only", "Secondary/CPU Only"])
 
     if bench_source == "📚 Real PDF Chunks from `./Files`" and local_pdfs:
         corpus = load_all_local_pdf_chunks(chunk_size=500, chunk_overlap=100)[:int(num_docs)]
@@ -458,8 +470,8 @@ with tab_benchmark:
         total_items = len(texts)
         results = {}
 
-        if target_mode in ["Both (Compare Spyre vs CPU)", "CPU Only"]:
-            st.info(f"⏳ Running CPU Benchmark ({total_items} items via {cpu_url})...")
+        if target_mode in ["Both (Compare Primary vs Secondary/CPU)", "Secondary/CPU Only"]:
+            st.info(f"⏳ Running Secondary / CPU Benchmark ({total_items} items via {cpu_url})...")
             cpu_progress = st.progress(0)
             cpu_start = time.perf_counter()
             
@@ -469,7 +481,7 @@ with tab_benchmark:
                     get_batch_embeddings(cpu_client, batch)
                     cpu_progress.progress(min(1.0, (i + batch_size) / len(texts)))
                 cpu_total_time = time.perf_counter() - cpu_start
-                results["Power CPU"] = {
+                results["Secondary / CPU"] = {
                     "time": cpu_total_time,
                     "throughput": total_items / cpu_total_time,
                     "latency_per_doc_ms": (cpu_total_time / total_items) * 1000
@@ -477,47 +489,47 @@ with tab_benchmark:
             except Exception as e:
                 st.error(f"CPU Benchmark failed: {e}")
 
-        if target_mode in ["Both (Compare Spyre vs CPU)", "Spyre Only"]:
-            st.info(f"⏳ Running Spyre Card Benchmark ({total_items} items via {spyre_url})...")
-            spyre_progress = st.progress(0)
-            spyre_start = time.perf_counter()
+        if target_mode in ["Both (Compare Primary vs Secondary/CPU)", "Primary Only"]:
+            st.info(f"⏳ Running Primary Accelerator Benchmark ({total_items} items via {primary_url})...")
+            primary_progress = st.progress(0)
+            primary_start = time.perf_counter()
             
             try:
                 for i in range(0, len(texts), batch_size):
                     batch = texts[i : i + batch_size]
-                    get_batch_embeddings(spyre_client, batch)
-                    spyre_progress.progress(min(1.0, (i + batch_size) / len(texts)))
-                spyre_total_time = time.perf_counter() - spyre_start
-                results["Spyre Card"] = {
-                    "time": spyre_total_time,
-                    "throughput": total_items / spyre_total_time,
-                    "latency_per_doc_ms": (spyre_total_time / total_items) * 1000
+                    get_batch_embeddings(primary_client, batch)
+                    primary_progress.progress(min(1.0, (i + batch_size) / len(texts)))
+                primary_total_time = time.perf_counter() - primary_start
+                results["Primary (Spyre/Ollama)"] = {
+                    "time": primary_total_time,
+                    "throughput": total_items / primary_total_time,
+                    "latency_per_doc_ms": (primary_total_time / total_items) * 1000
                 }
             except Exception as e:
-                st.error(f"Spyre Benchmark failed: {e}")
+                st.error(f"Primary Benchmark failed: {e}")
 
         if results:
             st.success("✅ Benchmark Completed!")
             col_m1, col_m2, col_m3 = st.columns(3)
             
-            if "Power CPU" in results and "Spyre Card" in results:
-                cpu_tp = results["Power CPU"]["throughput"]
-                spyre_tp = results["Spyre Card"]["throughput"]
+            if "Secondary / CPU" in results and "Primary (Spyre/Ollama)" in results:
+                cpu_tp = results["Secondary / CPU"]["throughput"]
+                spyre_tp = results["Primary (Spyre/Ollama)"]["throughput"]
                 speedup = spyre_tp / cpu_tp if cpu_tp > 0 else 0
                 
-                col_m1.metric("Power CPU Throughput", f"{cpu_tp:.1f} chunks/sec", f"{results['Power CPU']['time']:.2f}s total")
-                col_m2.metric("Spyre Card Throughput", f"{spyre_tp:.1f} chunks/sec", f"{results['Spyre Card']['time']:.2f}s total")
-                col_m3.metric("Spyre Acceleration Speedup", f"{speedup:.2f}x", delta=f"+{((speedup-1)*100):.1f}%" if speedup > 1 else "N/A")
-            elif "Spyre Card" in results:
-                spyre_tp = results["Spyre Card"]["throughput"]
-                col_m1.metric("Spyre Card Throughput", f"{spyre_tp:.1f} chunks/sec")
-                col_m2.metric("Spyre Total Time", f"{results['Spyre Card']['time']:.2f}s")
-                col_m3.metric("Latency per Chunk", f"{results['Spyre Card']['latency_per_doc_ms']:.2f} ms")
-            elif "Power CPU" in results:
-                cpu_tp = results["Power CPU"]["throughput"]
-                col_m1.metric("Power CPU Throughput", f"{cpu_tp:.1f} chunks/sec")
-                col_m2.metric("CPU Total Time", f"{results['Power CPU']['time']:.2f}s")
-                col_m3.metric("Latency per Chunk", f"{results['Power CPU']['latency_per_doc_ms']:.2f} ms")
+                col_m1.metric("Secondary / CPU Throughput", f"{cpu_tp:.1f} chunks/sec", f"{results['Secondary / CPU']['time']:.2f}s total")
+                col_m2.metric("Primary Accelerator Throughput", f"{spyre_tp:.1f} chunks/sec", f"{results['Primary (Spyre/Ollama)']['time']:.2f}s total")
+                col_m3.metric("Acceleration Factor", f"{speedup:.2f}x", delta=f"+{((speedup-1)*100):.1f}%" if speedup > 1 else "N/A")
+            elif "Primary (Spyre/Ollama)" in results:
+                spyre_tp = results["Primary (Spyre/Ollama)"]["throughput"]
+                col_m1.metric("Throughput", f"{spyre_tp:.1f} chunks/sec")
+                col_m2.metric("Total Time", f"{results['Primary (Spyre/Ollama)']['time']:.2f}s")
+                col_m3.metric("Latency per Chunk", f"{results['Primary (Spyre/Ollama)']['latency_per_doc_ms']:.2f} ms")
+            elif "Secondary / CPU" in results:
+                cpu_tp = results["Secondary / CPU"]["throughput"]
+                col_m1.metric("Throughput", f"{cpu_tp:.1f} chunks/sec")
+                col_m2.metric("Total Time", f"{results['Secondary / CPU']['time']:.2f}s")
+                col_m3.metric("Latency per Chunk", f"{results['Secondary / CPU']['latency_per_doc_ms']:.2f} ms")
 
             df_results = pd.DataFrame(results).T.reset_index().rename(columns={"index": "Hardware Target"})
             st.markdown("### 📊 Performance Comparison")
